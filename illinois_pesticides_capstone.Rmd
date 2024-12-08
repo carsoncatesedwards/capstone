@@ -1,0 +1,621 @@
+---
+title: "Assessing Pesticide Contamination in Illinois Water Supply and the Impact of Agricultural Practices"
+author: Carson Edwards
+output: html_notebook
+---
+
+1) Load in libraries
+
+```{r}
+library(purrr)
+library(readr)
+library(corrplot)
+library(forecast)
+library(tidyr)
+library(randomForest)
+library(xgboost)
+library(changepoint)
+library(urbnmapr)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+```
+
+##############################################################################################################################
+
+                                                TRI PROGRAM DATASET ANALYSIS SECTION 
+
+##############################################################################################################################
+
+2) Load and format TRI program data
+
+```{r}
+folder_path <- "C:/Users/carso/Downloads/il_chemicals/"
+file_list <- list.files(path = folder_path, pattern = "\\d{4}_il\\.csv$", full.names = TRUE)
+
+combined_data <- map_df(file_list, ~ read_csv(.x, col_types = cols(.default = "c")))
+
+# Clean up column names
+cleaned_colnames <- colnames(combined_data) %>%
+  gsub("^\\d+\\.\\s*", "", .) %>%  
+  gsub("\\s+", "_", .) %>%        
+  tolower()                       
+colnames(combined_data) <- cleaned_colnames
+
+# Mutate total releases to numeric, convert yes/no to logical, and as numeric
+combined_data <- combined_data %>%
+  mutate(
+    total_releases = as.numeric(total_releases),
+    across(where(~ is.character(.) & all(. %in% c("YES", "NO"))), ~ . == "YES"),
+    across(where(is.logical), as.numeric)
+  )
+
+# Get sums of county, chemical, and year combinations
+chemical_by_county <- combined_data %>%
+  group_by(county, chemical, year) %>%
+  summarise(total_releases = sum(total_releases, na.rm = TRUE))
+
+# Load in our county map data
+illinois_counties <- get_urbn_map("counties", sf = FALSE) %>%
+  filter(state_abbv == "IL")
+
+head(combined_data)
+head(chemical_by_county)
+```
+
+3) Correlation modeling
+
+```{r}
+# Selecting our numeric data, we have already converted true/false to 1/0
+numeric_data <- combined_data %>%
+  select_if(is.numeric)
+correlation_matrix <- cor(numeric_data, use = "complete.obs")
+
+correlation_matrix
+
+colnames(correlation_matrix) <- gsub("_", " ", colnames(correlation_matrix))
+rownames(correlation_matrix) <- gsub("_", " ", rownames(correlation_matrix))
+
+# Paste into console to see a readable plot in plot window
+corrplot(correlation_matrix, 
+         method = "color", 
+         tl.cex = 1.5, 
+         tl.col = "black",  
+         addCoef.col = "black")  
+```
+
+4) Random forest model for feature importance
+
+```{r}
+# Only selecting fields of interest
+model_data <- combined_data %>%
+  select(total_releases, year, federal_facility, elemental_metal_included, clean_air_act_chemical, metal, carcinogen, pbt, pfas) 
+
+set.seed(123)  
+rf_model <- randomForest(total_releases ~ ., data = model_data, importance = TRUE, ntree = 500)
+
+print(rf_model)
+importance(rf_model)
+varImpPlot(rf_model, 
+           main = "Random Forest Classifier for TRI Program Variable Importance")
+```
+
+
+5) Change point analysis for TRI program data
+
+```{r}
+get_change_points <- function(df) {
+  df$year <- as.numeric(df$year)
+  df <- df[order(df$year), ]
+  if (any(is.na(df$total_releases)) || !is.numeric(df$total_releases)) {
+    return(NULL)
+  }
+  
+  releases <- as.numeric(df$total_releases)  
+  max_Q <- length(releases) - 1
+
+  # The max change points to search for. Taking either length of county chemical combinations or total number of rows. Want less change points rather than more
+  Q <- min(3, max_Q)
+  if (Q < 1) {
+    return(NULL)
+  }
+  
+  # Was getting too many warnings with the output
+  suppressWarnings({
+    cpt <- cpt.mean(releases, method = "BinSeg", penalty = "BIC", Q = Q)
+  })
+
+  return(cpts(cpt))
+}
+
+change_points <- list()
+
+# Only want combinations with at least 3 reported years
+valid_data <- chemical_by_county %>%
+  group_by(county, chemical) %>%
+  filter(n() >= 3) %>%
+  ungroup()
+
+# Need unique pairs 
+unique_combinations <- unique(valid_data[, c("county", "chemical")])
+
+# For each unique combination of county and chemical, take the subset of data and run get change points function
+for (i in 1:nrow(unique_combinations)) {
+  county1 <- unique_combinations$county[i]
+  chemical1 <- unique_combinations$chemical[i]
+  subset_data <- subset(valid_data, county == county1 & chemical == chemical1)
+  
+  result <- get_change_points(subset_data)
+
+  if (!is.null(result)) {
+    change_points[[paste(county1, chemical1, sep = "_")]] <- result
+  } else {
+    change_points[[paste(county1, chemical1, sep = "_")]] <- "No valid data or change points"
+  }
+}
+```
+
+6) Functions for plotting change points and getting year counts
+
+```{r}
+plot_change_points <- function(df, change_points) {
+  df$year <- as.numeric(df$year)
+  
+  # Order by year
+  df <- df[order(df$year), ]
+  
+  # Create change point plot of total releases
+  change_point_plot <- ggplot(df, aes(x = year, y = total_releases)) +
+    geom_line() +
+    geom_point() +
+    labs(title = paste(df$county[1], df$chemical[1], "Change Point Detection"),
+         x = "Year", y = "Total Releases") +
+    theme_minimal()
+  
+  # Plotting change points using a vertical red line 
+  if (!is.null(change_points) && length(change_points) > 0) {
+    change_point_plot <- change_point_plot + geom_vline(xintercept = df$year[change_points], color = "red", linetype = "dashed")
+  }
+  print(change_point_plot)
+}
+
+analyze_change_points <- function(chemical_name, chemical_by_county, change_points) {
+  unique_counties <- unique(chemical_by_county$county[chemical_by_county$chemical == chemical_name])
+  change_point_years <- c()
+  
+  # For each county chemical combination, get the change point counts 
+  for (county1 in unique_counties) {
+    subset_data <- subset(chemical_by_county, county == county1 & chemical == chemical_name)
+    change_point_result <- change_points[[paste(county1, chemical_name, sep = "_")]]
+    
+    if (!is.null(change_point_result)) {
+      plot_change_points(subset_data, change_point_result)
+      change_point_years <- c(change_point_years, change_point_result)  # Collect change point years
+    }
+  }
+  
+  change_point_year_counts <- table(change_point_years)
+  
+  # Plot the totals
+  barplot(change_point_year_counts, 
+          main = paste("Frequency of Change Point Years for", chemical_name), 
+          xlab = "Year", 
+          ylab = "Frequency", 
+          col = "skyblue", 
+          las = 2, 
+          names.arg = as.character(as.numeric(names(change_point_year_counts)) + 2000)) # Have years display correctly
+
+}
+```
+
+Ammonia example
+
+```{r}
+analyze_change_points("Ammonia", chemical_by_county, change_points)
+```
+
+Benzene example 
+
+```{r}
+analyze_change_points("Benzene", chemical_by_county, change_points)
+```
+
+Change point detection by year
+
+```{r}
+change_points <- list()
+
+# Group by year and chemical this time
+valid_data <- chemical_by_county %>%
+  group_by(year, chemical) %>%
+  summarise(total_releases = sum(total_releases, na.rm = TRUE)) %>%
+  filter(n() >= 3) %>%
+  ungroup()
+
+# Only unique chemicals since no counties
+unique_chemicals <- unique(valid_data$chemical)
+
+# For each unique chemical, take the subset of data and run get change points function
+for (i in 1:length(unique_chemicals)) {
+  chemical1 <- unique_chemicals[i]
+  subset_data <- subset(valid_data, chemical == chemical1)
+  
+  result <- get_change_points(subset_data)
+
+  if (!is.null(result)) {
+    change_points[[chemical1]] <- result
+  } else {
+    change_points[[chemical1]] <- "No valid data or change points"
+  }
+}
+
+plot_change_points <- function(df, change_points) {
+  df$year <- as.numeric(df$year)
+  
+  # Order by year
+  df <- df[order(df$year), ]
+   
+  # Create change point plot of total releases
+  change_point_plot <- ggplot(df, aes(x = year, y = total_releases)) +
+    geom_line() +
+    geom_point() +
+    labs(title = paste(df$chemical[1], "Change Point Detection"),
+         x = "Year", y = "Total Releases") +
+    theme_minimal()
+  
+  # Plotting change points using a vertical red line 
+  if (!is.null(change_points) && length(change_points) > 0) {
+    change_point_plot <- change_point_plot + geom_vline(xintercept = df$year[change_points], color = "red", linetype = "dashed")
+  }
+  print(change_point_plot)
+}
+
+analyze_change_points <- function(chemical_name, chemical_by_county, change_points) {
+  subset_data <- subset(chemical_by_county, chemical == chemical_name)  # Only chemical for this subset
+  change_point_result <- change_points[[chemical_name]]
+  
+  if (!is.null(change_point_result)) {
+    plot_change_points(subset_data, change_point_result)
+    change_point_years <- change_point_result  # Collect change point years
+  } else {
+    change_point_years <- c()
+  }
+}
+```
+
+Ammonia change points statewide
+
+```{r}
+analyze_change_points("Ammonia", valid_data, change_points)
+```
+
+Benzene change points statewide
+
+```{r}
+analyze_change_points("Benzene", valid_data, change_points)
+```
+
+Atrazine change points statewide
+
+```{r}
+analyze_change_points("Atrazine", valid_data, change_points)
+```
+
+2,4-D change points statewide
+
+```{r}
+analyze_change_points("2,4-D", valid_data, change_points)
+```
+
+
+7) Geospatial analysis for TRI program data
+
+Average yearly increase function
+
+```{r}
+plot_avg_yearly_increase <- function(chemical_name, chemical_by_county, illinois_counties) {
+  
+  # Filter by chemical of interest, group by county, arrange by year, calculate yearly change, take the mean and drop groups
+  avg_increase_data <- chemical_by_county %>%
+    filter(chemical == chemical_name) %>%
+    group_by(county) %>%
+    arrange(year) %>%
+    mutate(yearly_change = total_releases - lag(total_releases)) %>%
+    summarize(avg_yearly_increase = mean(yearly_change, na.rm = TRUE), .groups = "drop") %>%
+    rename(county_name = county)
+  
+  # Convert county names to regular format ex "Jo Daviess County"
+  avg_increase_data$county_name <- paste(tools::toTitleCase(tolower(avg_increase_data$county_name)), "County")
+  
+  # Set up counties data with average increase data by county name
+  spatial_data <- left_join(illinois_counties, avg_increase_data, by = "county_name")
+  
+  # Plot using Albers projection to minimize warping, remove axis labels, and apply nice color scheme
+  plot <- ggplot() +
+    geom_polygon(data = spatial_data,
+                 mapping = aes(x = long, y = lat, group = group, fill = avg_yearly_increase),
+                 color = "#ffffff", size = 0.25) +
+    coord_map(projection = "albers", lat0 = 39, lat1 = 45) +
+    scale_fill_gradient2(midpoint = 0, low = "blue", mid = "lightblue", high = "orange", 
+                     na.value = "grey", name = "Average Yearly Increase in lbs") +
+    labs(title = paste("Average Yearly Increase in Total Releases of", chemical_name)) +
+    theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank()) 
+  
+  print(plot)
+}
+```
+
+Ammonia average yearly increase (Jo Daviess county of interest)
+
+```{r}
+plot_avg_yearly_increase("Ammonia", chemical_by_county, illinois_counties)
+```
+
+Benzene average yearly increase (Benzene generally decreasing)
+
+```{r}
+plot_avg_yearly_increase("Benzene", chemical_by_county, illinois_counties)
+```
+
+2,4-D average yearly increase (Cook county of interest)
+
+```{r}
+plot_avg_yearly_increase("2,4-D", chemical_by_county, illinois_counties)
+```
+
+Mercury average yearly increase 
+
+```{r}
+plot_avg_yearly_increase("Mercury", chemical_by_county, illinois_counties)
+```
+
+Hydrazine average yearly increase
+
+```{r}
+plot_avg_yearly_increase("Hydrazine", chemical_by_county, illinois_counties)
+```
+
+Atrazine average yearly increase
+
+```{r}
+plot_avg_yearly_increase("Atrazine", chemical_by_county, illinois_counties)
+```
+Acetochlor shows no reported releases
+
+```{r}
+plot_avg_yearly_increase("Acetochlor", chemical_by_county, illinois_counties)
+```
+
+##############################################################################################################################
+
+                                             USGS WATER QUALITY DATASET ANALYSIS SECTION 
+
+##############################################################################################################################
+
+1) Load in and format the USGS data
+
+```{r}
+chemical_data <- fread("C:/Users/carso/Downloads/waterdata/waterdata.csv", sep = "\t", fill = TRUE, quote = "")
+
+# Format date field
+chemical_data$sample_dt <- as.Date(chemical_data$sample_dt, format="%Y-%m-%d")
+chemical_data <- chemical_data %>% drop_na(result_va)
+```
+
+Examine data
+
+```{r}
+head(chemical_data)
+summary(chemical_data)
+```
+
+2) Load in and format parameter data 
+
+```{r}
+param_data <- read.delim("C:/Users/carso/Downloads/waterdata/param_dictionary.txt", sep = "\t", header = FALSE, stringsAsFactors = FALSE, col.names = "field")
+
+# Format param data so we can match it. Don't need field
+param_data <- param_data %>%
+  mutate(
+    parm_cd = as.numeric(sub(" - .*", "", field)),
+    description = sub("^[0-9]+ - ", "", field) 
+  ) %>%
+  select(-field)   
+
+```
+
+3) Function for filtering by chemicals in the parameter codes and using a SARIMA model to forecast
+
+```{r}
+forecast_chemical <- function(chemical_name, start_date, param_data, chemical_data, forecast_horizon = 36) {
+  
+  # Get data for chemical of interest using grepl
+  data <- param_data %>%
+    filter(grepl(chemical_name, description, ignore.case = TRUE))
+  
+  # Get parameter codes that match that chemical and select data after start date
+  filtered_chemical_data_after_start <- chemical_data %>%
+    filter(parm_cd %in% data$parm_cd, sample_dt > as.Date(start_date)) %>%
+    select(site_no, sample_dt, sample_end_dt, result_va, result_lab_cm_tx) %>%
+    mutate(year_month = format(sample_dt, "%Y-%m"))
+  
+  # Get outlier threshold
+  outlier_threshold <- quantile(filtered_chemical_data_after_start$result_va, 0.99, na.rm = TRUE)
+  
+  # Remove outliers above the threshold
+  filtered_chemical_data_no_outliers <- filtered_chemical_data_after_start %>%
+    filter(result_va <= outlier_threshold)
+  
+  # Get data by year month and get mean
+  data_by_month <- filtered_chemical_data_no_outliers %>%
+    group_by(year_month) %>%
+    summarise(result_va = mean(result_va, na.rm = TRUE)) %>%
+    ungroup() %>%
+    arrange(year_month)
+  
+  # Convert year month to date
+  data_by_month <- data_by_month %>%
+    mutate(year_month = as.Date(paste0(year_month, "-01")))
+  
+  # Create time series using the data
+  result_va_ts_monthly <- ts(
+    data_by_month$result_va, 
+    start = c(
+      as.numeric(format(min(data_by_month$year_month), "%Y")), 
+      as.numeric(format(min(data_by_month$year_month), "%m"))
+    ), 
+    frequency = 12
+  )
+  
+  # Fit SARIMA model
+  sarima_model <- auto.arima(result_va_ts_monthly, seasonal = TRUE)
+  
+  # Get forecast
+  forecast_monthly <- forecast(sarima_model, h = forecast_horizon)
+  
+  # Plot forecast
+  plot(
+    forecast_monthly, 
+    main = paste("Forecast of Monthly Average result_va for", chemical_name), 
+    xlab = "Year", 
+    ylab = "Average result_va"
+  )
+  
+  # Extract forecasted values
+  forecast_values <- as.data.frame(forecast_monthly)$`Point Forecast`
+  
+  # Calculate the difference between the first and last forecasted values
+  forecast_increase <- forecast_values[length(forecast_values)] - forecast_values[1]
+  
+  # Print increase or decrease
+  if (forecast_increase > 0) {
+    cat("The forecast indicates an increase of", forecast_increase, "over the next", forecast_horizon, "months.\n")
+  } else if (forecast_increase < 0) {
+    cat("The forecast indicates a decrease of", abs(forecast_increase), "over the next", forecast_horizon, "months.\n")
+  } else {
+    cat("The forecast indicates no significant change over the forecast period.")
+  }
+  
+  # Print summary
+  print(summary(sarima_model))
+  
+  # Return the forecast and model summary
+  return(list(
+    model = sarima_model,
+    forecast = forecast_monthly
+  ))
+  
+}
+
+```
+
+2,4-D SARIMA forecast post 2014 since the EPA approved use in 2014. It picks up a decrease but when reading the chart you can see its just the top end of the season its starting at so note this as possible increase
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "2,4-D",
+  start_date = "2014-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 36
+)
+result
+
+```
+
+Ammonia SARIMA forecast. Slight increase detected though it starts at the bottom of the season. Peaks are higher for years post 2020.
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Ammonia",
+  start_date = "2000-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 36
+)
+result
+```
+
+Atrazine SARIMA forecast. It picks up a decrease but when reading the chart you can see its just the top end of the season its starting at. Note this as possible increase because the bottom line of the prediction looks like it is increasing.
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Atrazine",
+  start_date = "2012-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 36
+)
+result
+```
+
+Benzene SARIMA forecast. Not enough data to predict anything with the model.
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Benzene",
+  start_date = "2000-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 36
+)
+result
+```
+
+Metolachlor SARIMA forecast. Found post 2012 was where most measurements happen. Increase detected
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Metolachlor",
+  start_date = "2012-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 36
+)
+result
+```
+
+Acetochlor SARIMA forecast. Increase detected
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Acetochlor",
+  start_date = "2013-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 36
+)
+result
+```
+
+Diazinon SARIMA forecast. Data has inconsistent drops and peaks, no forecast
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Diazinon",
+  start_date = "2000-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 36
+)
+result
+```
+
+Azoxystrobin SARIMA forecast. Increase detected
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Azoxystrobin",
+  start_date = "2000-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 36
+)
+result
+```
+
+
+
