@@ -481,7 +481,7 @@ forecast_chemical <- function(chemical_name, start_date, param_data, chemical_da
     forecast_monthly, 
     main = paste("Forecast of Monthly Average result_va for", chemical_name), 
     xlab = "Year", 
-    ylab = "Average result_va"
+    ylab = "Average Amount in Water Supply"
   )
   
   # Extract forecasted values
@@ -540,6 +540,27 @@ result
 ```
 
 Atrazine SARIMA forecast. It picks up a decrease but when reading the chart you can see its just the top end of the season its starting at. Note this as possible increase because the bottom line of the prediction looks like it is increasing.
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Atrazine",
+  start_date = "2000-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 60
+)
+result
+```
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Atrazine",
+  start_date = "2012-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 60
+)
+result
+```
 
 ```{r}
 result <- forecast_chemical(
@@ -566,6 +587,17 @@ result
 ```
 
 Metolachlor SARIMA forecast. Found post 2012 was where most measurements happen. Increase detected
+
+```{r}
+result <- forecast_chemical(
+  chemical_name = "Metolachlor",
+  start_date = "2012-01-01",
+  param_data = param_data,
+  chemical_data = chemical_data,
+  forecast_horizon = 60
+)
+result
+```
 
 ```{r}
 result <- forecast_chemical(
